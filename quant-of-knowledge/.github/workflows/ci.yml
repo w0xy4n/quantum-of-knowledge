@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    # A glob rather than a list, because the list was wrong within a week of
+    # being written: it said `[v2]`, work moved to `v3`, and every push to it
+    # ran nothing. The version branches are this project's long-lived lines, so
+    # matching the naming convention keeps the next one working without anyone
+    # remembering to come back here.
+    #
+    # Not every branch, though. A pull request from a branch in this repository
+    # would then run the whole suite twice — once for the push and once for the
+    # pull request — and the two runs land in different concurrency groups, so
+    # neither cancels the other.
+    branches: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch makes the in-flight run obsolete. Cancel it
+# rather than paying for two runs and reading the stale one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Kept in step with the bun that developers run locally. Bump both together.
+  BUN_VERSION: "1.4.0"
+
+jobs:
+  check:
+    name: Lint and format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Cache bun modules
+        uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: ${{ runner.os }}-bun-
+
+      # Fails if bun.lock does not already satisfy package.json, so a
+      # dependency added without committing the lockfile cannot slip through.
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      # `biome ci` is check without --write: lint rules, formatting and import
+      # order in one pass. --reporter=github annotates the diff inline.
+      - name: Biome
+        run: bun x biome ci --reporter=github
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Cache bun modules
+        uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: ${{ runner.os }}-bun-
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      # The suite is pure units — dates, the data layer, the mutation hook, the
+      # security helpers, the Canvas parser. No database, no network, no
+      # environment variables, which is why this job needs none of the setup the
+      # build job has.
+      - name: Test
+        run: bun test
+
+  build:
+    name: Type-check and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Cache bun modules
+        uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: ${{ runner.os }}-bun-
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      # next build type-checks too (next.config.mjs sets ignoreBuildErrors:
+      # false), but tsc alone takes seconds and reports every file at once,
+      # where the build stops at the first error after a full compile.
+      - name: Type-check
+        run: bun run typecheck
+
+      - name: Cache Next.js build
+        uses: actions/cache@v6
+        with:
+          path: .next/cache
+          key: ${{ runner.os }}-next-${{ hashFiles('bun.lock') }}-${{ hashFiles('**/*.ts', '**/*.tsx') }}
+          restore-keys: ${{ runner.os }}-next-${{ hashFiles('bun.lock') }}-
+
+      # No Supabase environment variables here on purpose. The three
+      # prerendered routes never touch Supabase, so a build that starts
+      # needing secrets is a regression worth failing on.
+      - name: Build
+        run: bun run build
