@@ -1,0 +1,428 @@
+# Evermind — Architecture
+
+How the application is put together, and why. Written against version 2.9.0.
+
+For running your own copy, see [`self-hosting.md`](self-hosting.md). For known problems with what is
+described here, see [`audit.md`](audit.md).
+
+---
+
+## 1. The shape of it
+
+Evermind has no backend of its own. It is a Next.js front end and a Supabase project, and the browser talks
+to Postgres directly.
+
+```
+                  ┌──────────────────────────────────────────┐
+                  │  Browser                                 │
+                  │  ┌────────────────────────────────────┐  │
+                  │  │ React 19 client components         │  │
+                  │  │  · SWR cache, key "assignments"    │  │
+                  │  │  · supabase-js (anon key)          │──┼──── reads & writes ────┐
+                  │  └────────────────────────────────────┘  │                        │
+                  └───────────────▲──────────────────────────┘                        │
+                                  │ HTML / RSC payload                                │
+                  ┌───────────────┴──────────────────────────┐                        │
+                  │  Next.js server (Node)                   │                        │
+                  │  ┌────────────────────────────────────┐  │                        │
+                  │  │ proxy.ts   — session refresh,      │  │                        │
+                  │  │              route guards          │  │                        ▼
+                  │  │ RSC pages  — first paint, auth     │──┼── reads ────►  ┌──────────────────┐
+                  │  │ /auth/callback — OAuth code swap   │──┼── auth  ────►  │    Supabase      │
+                  │  │ /api/account/delete — service role │──┼── admin ────►  │  Postgres + RLS  │
+                  │  └────────────────────────────────────┘  │                │  GoTrue (auth)   │
+                  └──────────────────────────────────────────┘                └──────────────────┘
+                                                                                       ▲
+                                                                          OAuth ───────┘
+                                                                    (Google / Discord / GitHub)
+```
+
+The consequence worth internalising: **Row Level Security is the authorisation layer.** There is no server
+route that mediates assignment reads or writes. If an RLS policy is wrong, the app is wrong — no amount of
+client-side care compensates. This is why `scripts/001_create_assignments_table.sql` is the most
+security-sensitive file in the repository.
+
+---
+
+## 2. Technology choices
+
+| Layer | Choice | Notes |
+|---|---|---|
+| Framework | Next.js 16, App Router | Server Components for first paint, client components for interaction. |
+| Runtime | React 19 | `use client` boundaries are drawn low: pages are server components, lists and cards are client. |
+| Language | TypeScript 5 | `strict` in `tsconfig.json`, but `ignoreBuildErrors` is on in `next.config.mjs`. |
+| Styling | Tailwind CSS 4 | Configured through `@tailwindcss/postcss`; theme tokens are CSS custom properties in `app/globals.css`. |
+| Components | shadcn/ui on Radix | Vendored into `components/ui`, configured by `components.json`. |
+| Data (server) | `@supabase/ssr` server client | Cookie-backed, used by RSC pages. |
+| Data (client) | `@supabase/supabase-js` + SWR | Single cache key, `mutate` after writes. |
+| Auth | Supabase Auth (GoTrue), OAuth only | Google, Discord, GitHub. No password or magic-link flow exists. |
+| Dates | date-fns 4 | Plus one hand-rolled UTC `Intl.DateTimeFormat` for hydration safety. |
+| Analytics | `@vercel/analytics` | Mounted unconditionally in the root layout. |
+| Package manager | Bun (`bun.lock` committed) | npm works; the lockfile will not be used. |
+
+---
+
+## 3. Request lifecycle
+
+### 3.1 `proxy.ts` — the edge guard
+
+Next.js 16 renamed middleware to **proxy**. `proxy.ts` at the repository root delegates to
+`lib/supabase/proxy.ts`, which does two jobs on every non-static request:
+
+1. **Refreshes the session.** It constructs a server Supabase client wired to the request/response cookie
+   jars and calls `auth.getUser()`. That call refreshes an expiring access token and writes the rotated
+   cookies onto the outgoing response. Without this, sessions would expire mid-visit.
+2. **Routes by auth state**, before any page renders:
+
+   | Path | Signed in | Signed out |
+   |---|---|---|
+   | `/` | → `/dashboard` | → `/preview` |
+   | `/dashboard*` | render | → `/auth/login` |
+   | `/auth*` | → `/dashboard` | render |
+   | everything else | render | render |
+
+   Note that `/settings` is **not** in this table — it is protected by its own check inside the page.
+
+The matcher excludes `_next/static`, `_next/image`, `favicon.ico` and common image extensions.
+
+There is a subtlety in the cookie plumbing worth preserving if you touch this file: when Supabase asks to set
+cookies, the code writes them onto the *request* first, then rebuilds `NextResponse.next({ request })` so the
+downstream render sees the fresh values, and only then copies them onto the response. Changing the order
+breaks session refresh in ways that only show up under token expiry.
+
+### 3.2 Server rendering
+
+`app/dashboard/page.tsx` runs on the server, calls `supabase.auth.getUser()` (a second guard behind the
+proxy — cheap insurance if the matcher is ever edited), then `fetchDashboardData(userId)` from
+`lib/data/dashboard.ts`. The result is passed into `<AssignmentsList initialData={...} />` as props.
+
+Every authenticated page is `export const dynamic = 'force-dynamic'`, because they all read cookies.
+
+### 3.3 Client hydration and the SWR handoff
+
+`AssignmentsList` is a client component holding the only SWR subscription in the app:
+
+```ts
+useSWR("assignments", fetchAssignments, {
+  fallbackData: initialData,
+  revalidateOnMount: !initialData,
+})
+```
+
+The server-fetched array seeds the cache, so there is no loading spinner on first paint and no duplicate
+fetch. Afterwards the client owns the data: every mutation calls `mutate("assignments")` and SWR refetches
+through the browser Supabase client.
+
+`"assignments"` is a bare string key used from four files (`assignments-list`, `assignment-card`,
+`add-assignment-dialog`, `edit-assignment-dialog`, and `settings-content`). It is effectively a global; a
+constant export would be safer.
+
+---
+
+## 4. Authentication
+
+### 4.1 The flow
+
+```
+  /auth/login  ──signInWithOAuth(provider, redirectTo)──►  Supabase GoTrue
+                                                                 │
+                                                                 ▼
+                                                    provider consent screen
+                                                                 │
+                                                                 ▼
+        /auth/callback?code=…  ◄──────────────────────────────────┘
+                 │
+                 │  exchangeCodeForSession(code)  → sets HttpOnly session cookies
+                 ▼
+            /dashboard        (or /auth/error?error=… on failure)
+```
+
+`redirectTo` is computed client-side in `getRedirectUrl()` — and is currently hardcoded to a specific
+production domain, which is the first thing a self-hoster must change. See audit finding **C1**.
+
+### 4.2 The three Supabase clients
+
+There are deliberately three, and using the wrong one is the easiest serious mistake to make in this
+codebase:
+
+| Module | Key | Runs in | Purpose |
+|---|---|---|---|
+| `lib/supabase/client.ts` | anon | browser | All user reads and writes. RLS applies. |
+| `lib/supabase/server.ts` | anon | RSC / route handlers | Reads on behalf of the signed-in user via cookies. RLS applies. |
+| `lib/supabase/admin.ts` | **service role** | server only | Bypasses RLS entirely. One caller: account deletion. |
+
+`admin.ts` carries a comment saying it must never appear in a `"use client"` module; treat that as a hard
+rule. A service-role key reaching the browser hands every row in the database to every visitor.
+
+### 4.3 Account deletion
+
+`POST /api/account/delete` is the destructive one of the two `/api/account/*` routes:
+
+1. Rejects anything that did not come from this site: `Sec-Fetch-Site` when the browser sends one, the
+   `Origin` header otherwise (`lib/security/origin.ts`). Supabase's `SameSite=Lax` cookies already block a
+   cross-site POST, but that is a default the app never sets, so it is asserted rather than assumed.
+2. Throttles — thirty requests per minute per address before the session lookup, then five per ten minutes
+   per user after it (`lib/security/rate-limit.ts`).
+3. Resolves the user from the session cookie — never from the request body, so the endpoint can only ever
+   delete the caller.
+4. Refuses with a clear 500 if `SUPABASE_SERVICE_ROLE_KEY` is unset, so a misconfigured deployment fails
+   loudly rather than silently.
+5. Calls `auth.admin.deleteUser(id)` with the service-role client. Assignments go with it: `user_id`
+   references `auth.users(id) ON DELETE CASCADE`.
+6. Signs the session out.
+
+The client (`delete-account-dialog.tsx`) requires the user to type their own email address, then clears the
+three `evermind-*` localStorage keys and redirects to login.
+
+---
+
+## 5. Data model
+
+Three tables. `scripts/001_create_assignments_table.sql`:
+
+```
+assignments
+  id          uuid   pk, default gen_random_uuid()
+  user_id     uuid   not null → auth.users(id) on delete cascade
+  title       text   not null
+  subject     text   not null            -- free text, not a foreign key
+  description text   null
+  due_date    timestamptz not null
+  priority    text   not null  check (low | medium | high)
+  status      text   not null  check (pending | completed), default 'pending'
+  created_at  timestamptz default now()
+  updated_at  timestamptz default now()  -- maintained by trigger, scripts/004
+  completed_at timestamptz null          -- maintained by trigger, see §5.1
+
+indexes: user_id, due_date, status, (user_id, completed_at) where status = 'completed'
+rls:     enabled; four policies, one per verb, all auth.uid() = user_id
+```
+
+And `scripts/002_create_classes_table.sql`, which backs the saved-class picker in Settings:
+
+```
+classes
+  id          uuid   pk, default gen_random_uuid()
+  user_id     uuid   not null → auth.users(id) on delete cascade
+  name        text   not null  check (char_length <= 100)
+  created_at  timestamptz default now()
+
+indexes: user_id; unique (user_id, lower(name))
+rls:     enabled; four policies, one per verb, all auth.uid() = user_id
+```
+
+Nothing references `classes`. It fills in the `subject` field on the way to an assignment and is forgotten
+after that, so renaming or deleting a class leaves existing assignments untouched.
+
+Two things about `status` are worth knowing before you write code against it:
+
+- **`'overdue'` is never written.** The application derives overdue-ness at render time as
+  `status !== 'completed' && isPast(due_date)`. The stored value is only ever `pending` or `completed`. A
+  timestamp cannot be made stale by a database column, so this is the right decision, and as of
+  `scripts/003` the CHECK constraint and the TypeScript union agree: the third state is gone from both.
+- **`updated_at` belongs to the database.** The `handle_updated_at` trigger (`scripts/004`) sets it on every
+  UPDATE. No client sends it, and one that did would be overridden.
+
+`subject` being free text means there is no course entity: grouping, colour-coding and per-course filtering
+all have nowhere to hang. Introducing a `courses` table is the single highest-leverage schema change
+available.
+
+### 5.1 Retention — the one place the app deletes data on its own
+
+Completed assignments are removed once they are old enough. The third table holds how old:
+
+```
+retention_settings
+  user_id           uuid    pk → auth.users(id) on delete cascade
+  enabled           boolean not null default true
+  delete_after_days integer not null default 30  check (between 1 and 3650)
+  updated_at        timestamptz not null default now()
+
+rls:     enabled + forced; ONE policy, SELECT only
+grants:  select to authenticated; insert/update/delete revoked from authenticated and anon
+```
+
+No row means the default, so nothing is written on sign-up. The write side is deliberately missing:
+the browser holds a real Postgres role, so an update policy here would hand the setting to everyone,
+and changing it is what the optional module sells. `pro/routes/retention.ts` is the only code in either
+repository that can write this table, and it does so with a service-role client typed to see this one
+table and nothing else.
+
+Three things to know before working on it:
+
+- **`completed_at` belongs to the database**, the same way `updated_at` does. The `handle_completed_at`
+  trigger stamps it when a row becomes complete, clears it when the row is reopened, and leaves it alone
+  when a row that is already complete is merely edited. Three code paths can complete an assignment — the
+  card menu, the edit dialog, and `PATCH /api/v1/assignments/:id` — and none of them sends this column.
+- **The sweep runs on dashboard load**, in `fetchDashboardData`. There is no cron in this repository and
+  adding one would land on every self-hoster, so the real behaviour is "removed the next time you open
+  Evermind after the period is up". The settings card says so rather than implying a precise date.
+  (The optional module installs a schedule of its own, in one of its own migrations — so it exists only
+  where that module does, and a build without it still has no cron. That is the same reasoning, not an
+  exception to it: the constraint was always "do not hand every self-hoster a background job", and a
+  private migration cannot.)
+- **Only completed rows with a known completion date are ever candidates.** Nothing pending is deleted
+  however overdue it is, and a completed row whose `completed_at` is null or unparseable is kept.
+  `lib/data/retention.ts` holds the rules and `tests/data-retention.test.ts` asserts each of these
+  refusals separately.
+
+An instance with no optional module deletes on the default schedule and offers nobody a way to change it.
+Its operator holds the service-role key and can write the table directly — see `docs/self-hosting.md`.
+
+---
+
+## 6. Component layout
+
+```
+app/
+  layout.tsx            root: fonts, three theme providers, Toaster, Analytics, FOUC scripts
+  page.tsx              redirect fallback (the proxy normally handles "/")
+  dashboard/page.tsx    RSC — auth guard + server fetch
+  preview/page.tsx      RSC — generates mock data, revalidate = 3600
+  settings/page.tsx     RSC — auth guard
+  privacy/page.tsx      static
+  auth/login            client — three OAuth buttons
+  auth/callback         route handler — code → session
+  auth/error            error display
+  api/account/delete    route handler — service-role deletion
+
+components/
+  header.tsx                    nav, theme toggle, avatar menu, sign-out
+  assignments-list.tsx          SWR owner; stats + weekly view + four tabs
+  assignment-card.tsx           one assignment; complete / reopen / edit / delete
+  stats-cards.tsx               the only pure server-renderable component here
+  weekly-view.tsx               seven-day strip, week navigation
+  add-/edit-assignment-dialog   forms (hand-rolled useState, not React Hook Form)
+  preview-*                     in-memory mirrors of the above for /preview
+  settings-content.tsx          1000 lines: account, imports, theming
+  delete-account-dialog.tsx     typed-email confirmation
+  *-provider.tsx                theme, compact mode, colour theme
+  ui/                           60 vendored shadcn components (21 in use)
+
+lib/
+  supabase/{client,server,admin,proxy}.ts
+  data/dashboard.ts     server-side fetch helpers
+  types.ts              hand-written row types
+  utils.ts              cn()
+```
+
+### Preview mode
+
+`/preview` is a full parallel implementation, not a flag. `PreviewAssignmentsList` holds the array in
+`useState`, and `AssignmentCard` accepts `isPreview` plus `onPreviewStatusChange` / `onPreviewDelete`
+callbacks that replace the Supabase calls. The mock rows are generated relative to `new Date()` at render
+time on the server, with `revalidate = 3600` so the "due in 2 days" labels do not freeze at build time.
+
+The cost of the approach is that `assignments-list.tsx` and `preview-assignments-list.tsx` duplicate the same
+filtering, tab structure and empty states, and drift is already visible (the preview `TabsList` has
+`overflow-x-auto`; the real one does not).
+
+---
+
+## 7. Rendering and hydration
+
+The server has no timezone. It renders in UTC; the visitor's browser does not. Three mechanisms keep this
+from producing hydration mismatches, and all three are load-bearing:
+
+1. **`useMounted()`** (`hooks/use-mounted.ts`) returns `false` for SSR and the first client render, `true`
+   afterwards. Anything that depends on the visitor's clock renders a neutral placeholder until then. The
+   weekly view renders seven skeletons rather than seven days.
+2. **A UTC-pinned formatter.** `assignment-card.tsx` builds an `Intl.DateTimeFormat` fixed to
+   `timeZone: "UTC"` that reproduces `format(date, "MMM d, yyyy")`. The first render uses it; post-hydration
+   renders switch to relative labels ("Due today", "Due tomorrow").
+3. **Blocking `<head>` scripts.** `compactModeScript` and `colorThemeScript` are injected via
+   `dangerouslySetInnerHTML` and run before React hydrates, reading localStorage and setting the `compact`
+   class and `--primary` / `--ring` custom properties. This prevents a flash of unthemed content that React
+   cannot prevent, because React does not run before paint. `next-themes` does the same for light/dark.
+
+The rule when adding a feature: **if it reads `Date.now()`, the visitor's timezone, or localStorage, it must
+be gated behind `useMounted()` or handled by a head script.** The alternative is a hydration error in
+production for every user outside UTC.
+
+---
+
+## 8. Theming
+
+Three independent systems stacked on the same document element:
+
+| System | Storage | Mechanism |
+|---|---|---|
+| Light / dark / system | `next-themes` (`theme` key) | `class="dark"` on `<html>` |
+| Compact density | `evermind-compact-mode` | `class="compact"` on `<html>`; ~20 CSS overrides in `globals.css` |
+| Colour theme | `evermind-color-theme`, `evermind-custom-themes` | inline `--primary` / `--ring` on `<html>` |
+
+Eight built-in colour themes ship in `DEFAULT_CUSTOM_THEMES`, and users can add their own. On first run the
+provider *copies* the built-ins into localStorage, then filters them back out of every list by id — so the
+stored copy is redundant.
+
+Each theme declares five colours. **Only `primary` is ever applied**, as `--primary` and `--ring`; the
+settings UI likewise only exposes a primary-colour picker. See audit finding **M5**.
+
+`app/globals.css` defines the token layer: `:root` for light, `.dark` for dark, `:root.compact` for density,
+plus the shadcn semantic tokens (`--background`, `--foreground`, `--card`, `--muted`, `--destructive`, …) in
+`oklch()`.
+
+---
+
+## 9. Build and deployment
+
+`next.config.mjs`:
+
+- `typescript.ignoreBuildErrors: true` — type errors do not fail the build.
+- `images.unoptimized: true` — no Image Optimization API needed, so any host will do.
+- `experimental.optimizePackageImports` for `lucide-react`, `date-fns`, several Radix packages and
+  `recharts` — barrel-file tree shaking.
+- `experimental.serverActions.bodySizeLimit: '2mb'` — inert; the app defines no Server Actions.
+- `compiler.removeConsole` in production — including `console.error`.
+
+Code splitting is manual: `WeeklyView` and `AddAssignmentDialog` are `React.lazy` in `assignments-list.tsx`,
+`EditAssignmentDialog` in `assignment-card.tsx`, each behind a `<Suspense>` with a skeleton.
+
+The application is a standard Node Next.js server (`next build` → `next start`). It has no filesystem state,
+no background jobs and no websockets, so it scales horizontally without coordination. Vercel is the assumed
+host — `@vercel/analytics` is wired in and the auth callback has a Vercel-shaped `x-forwarded-host` branch —
+but nothing else depends on it.
+
+---
+
+## 10. What is deliberately absent
+
+Useful to know so you do not go looking:
+
+- **No API layer for assignments, in this repository.** The browser is the client of Postgres, and the app
+  itself calls no route to read or write coursework. `lib/api/` holds the pieces one would be built from —
+  the `withUser` harness and the Zod schemas — and `app/api/v1/[[...path]]/` is a shell that answers 404
+  unless the optional module supplies a handler. See `docs/open-core.md`. Anyone running their own instance
+  has the database credentials, which is more than that API offers.
+- **No Server Actions.** Every mutation is a client-side Supabase call.
+- **No global state manager.** SWR's cache is the store; React context covers only theming.
+- **No migration tooling.** Numbered SQL files, run by hand in the Supabase SQL editor, in order. Nothing
+  records which have been applied.
+- **No server-side validation on the path the app actually uses.** The browser writes to PostgREST directly,
+  so CHECK constraints and RLS are the only enforcement there. The schemas in `lib/api/schemas.ts` mirror
+  those constraints for callers that do go through a route, and the database's copy is the one that counts.
+
+---
+
+## 11. Extending it
+
+A few notes for the most likely changes.
+
+**Adding a column.** Write the next numbered file in `scripts/` rather than editing an existing one —
+deployments have already run those, and will never pick up an edit. Update `lib/types.ts` (or, better, switch to `supabase gen types typescript`). Insert paths that need
+updating: `add-assignment-dialog.tsx`, `edit-assignment-dialog.tsx`, and the Canvas import in
+`settings-content.tsx`.
+
+**Adding a table.** Enable RLS on it in the same statement block that creates it, and write all four policies
+with both `USING` and `WITH CHECK`. A table with RLS enabled and no policy is invisible; a table without RLS
+enabled is world-readable through the anon key.
+
+**Adding a protected page.** Add the path prefix to the proxy's guard list *and* call `auth.getUser()` in the
+page. The proxy is a redirect for user experience; the page check is the actual guard.
+
+**Adding a mutation.** Read the `{ error }` result and surface it through `toast()`. Then
+`mutate("assignments")`. The existing call sites do not do the first part — do not copy them.
+
+**Adding an import format.** The parser lives inline in `settings-content.tsx`. Lifting it into
+`lib/import/` as pure functions over `string → ParsedAssignment[]` would make it testable, which it currently
+is not, and would shrink the largest file in the repository.

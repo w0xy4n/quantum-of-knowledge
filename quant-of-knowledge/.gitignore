@@ -1,0 +1,44 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files
+.env*
+!.env.example
+
+# Local database and uploaded files
+/data/
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# sample course data from canvas
+course-data.js
+
+# The commercial module. Proprietary, and this repository is GPL-3.0 — so it is
+# ignored here rather than merely untracked, because the cost of one absent-minded
+# `git add -A` is publishing code that was never meant to be distributed.
+#
+# It is a submodule (see .gitmodules), and `git submodule add` refuses an ignored
+# path, which is why it was added with --force. Keeping the entry after the fact
+# is deliberate: the gitlink is tracked regardless, so this only ever stops the
+# submodule's *contents* being added to this repository by accident.
+/pro/

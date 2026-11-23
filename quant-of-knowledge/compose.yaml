@@ -1,0 +1,47 @@
+# Локальный self-hosted запуск приложения и PostgreSQL.
+# Перед публичным развёртыванием замените BETTER_AUTH_SECRET и пароль PostgreSQL.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: evermind
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d evermind"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  web:
+    build: .
+    image: evermind:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - path: .env.local
+        required: false
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/evermind
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-local-docker-secret-change-before-public-deployment}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
+      NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
+      UPLOAD_DIR: /app/data/uploads
+    ports:
+      - "3000:3000"
+    volumes:
+      - uploads:/app/data/uploads
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  postgres_data:
+  uploads:
